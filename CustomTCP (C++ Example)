@@ -1,0 +1,1003 @@
+#include "basic_io.h"
+#include "test.h"
+#include "DM9000A.C"
+#include "LCD.h"
+#include "display2.h"
+#include "my_includes.h" // allows flash writing/reading
+#include "system.h"
+
+#define pack(x, y) (alt_u16)(((alt_u16)x << 8) | (alt_u16)y)
+#define pack32(w, x, y, z) (alt_u32)(((alt_u32)w << 3*8) | \
+         ((alt_u32)x << 2*8) | \
+         ((alt_u32)y << 8) | \
+         ((alt_u32)z))
+         
+#define LED_BASE    0x00681070
+#define LED_GREEN_BASE  0x00681080
+#define CRC         0xEDB88320
+#define IMG_SIZE        38400
+#define RAW_IMG_SIZE    307200
+#define MIN_LINK_SIZE   46
+#define MAX_LINK_SIZE   460 /*1476*/  //1440 is the transition from 28 packets to 27 packets given our payload 
+#define PAYLOAD         2
+#define UDP_HLEN        8
+#define IP_HLEN         20
+#define LINK_HLEN       14
+#define LINK_TLEN       4
+#define HEADERS         46
+#define CMD_HLEN        1
+
+#define ACK     0xAA
+#define NAK     0xFF
+#define L2ACK   0xF0
+
+#define IPV         0x4
+#define HDR_LEN     0x5
+#define ID          0x5
+#define UDP_PROTO   0x11
+#define TTL         0x10
+#define LOCAL_PORT  0xFFFF
+#define REMOTE_PORT 0xFFFF
+#define LOCAL_ADDR  0x0A000001
+#define REMOTE_ADDR 0x0A000001
+
+#define GOOD             0x0000
+#define BAD_LINK_ADDR    0x0001
+#define BAD_LINK_SIZE    0x0002
+#define BAD_LINK_CRC     0x0004
+#define BAD_ETHER_TYPE   0x0008
+#define BAD_UDP_CHKSM    0x0010
+#define BAD_UDP_LEN      0x0020
+#define BAD_UDP_SRC_PORT 0x0040
+#define BAD_UDP_DST_PORT 0x0080
+#define BAD_IP_LEN       0x0100
+#define BAD_SRC_IP       0x0200
+#define BAD_DST_IP       0x0400
+#define BAD_IP_CHKSM     0x0800
+#define BAD_IP_VERSION   0x1000
+#define BAD_IP_ID        0x2000
+#define BAD_IP_PROTO     0x4000
+#define TIMEOUT          0x8000
+
+#define MASTER  0
+#define SLAVE   1
+
+#define TICK    2500
+
+alt_u8 remote_addr[6]={ 0x01, 0x60, 0x6E, 0x11, 0x02, 0x3C  };
+unsigned int aaa, rx_len, i, packet_num;
+alt_u8 RXT[1440+IP_HLEN+UDP_HLEN+LINK_HLEN+LINK_TLEN];
+//alt_u8 rcv_img[IMG_SIZE];
+int l2ack, ack, is_cmd, wait_for_l2ack;
+char img[307200];
+
+#define SEND    0x11
+#define INVERT  0x12
+#define ROTATE  0x13
+#define MIRROR  0x14
+#define EDGE    0x15
+#define TIMESTAMP 0x16
+
+int rlen;
+int chunk;
+int transmit = 0;
+alt_u8 count;       // which packet this is for the photo
+alt_u8 command;
+
+#define TALEN 3
+unsigned char testArray[] = { 0xF0,0xFF,0xF0,0xF0,0xF0,0x0F/*, //80 00 30
+                                0xFF,0x00,0xFF,0x00,0xFF,0x07*///00 00 30
+                            };
+
+#define UTICK 20
+#define XLEN 3*IMG_SIZE
+#define RLE_IMG_SIZE IMG_SIZE
+#define RLEN 0x4a0a
+
+unsigned char xtra_smooshed[XLEN];
+unsigned char raw_img[RAW_IMG_SIZE];
+unsigned char uncomp_img[RAW_IMG_SIZE];
+unsigned char smooshed_pic[IMG_SIZE];
+unsigned char rle_img[RLE_IMG_SIZE];
+int xlen = 0;
+int smooshed_index = 0;
+int xtra_index = 0;
+int doCompress = 0;
+
+//command rcv_cmd;
+// dest addr, source addr, payload, payload length, crc
+// TODO: enforce payload lengths
+
+void print_stream(alt_u8* s, int l, int o) {
+    //printf("til %x @ s: %x\n", l, s);
+    int i;
+    for (i = 0; i < l; i++) {
+        if (i % 16 == 0)
+            printf("\n");
+        printf("%2x ", s[o+i]);
+    }
+    printf("\n");
+    //printf("s: %x\n", s);
+}
+
+void shift(alt_u8 *v, int l) {
+    int i;
+    for (i = l-1; i > 0; i--) {
+        v[i] >>= 1;
+        if (v[i-1] & 0x01)
+            v[i] += 0x80;
+    }
+    v[0] = v[0] >> 1;
+}
+
+unsigned char flip(unsigned char c) {
+    unsigned char t = 0;
+    t =  ((c & 0x80) >> 7) | ((c & 0x40) >> 5) | ((c & 0x20) >> 3) | ((c & 0x10) >> 1);
+    t |= ((c & 0x08) << 1) | ((c & 0x04) << 3) | ((c & 0x02) << 5) | ((c & 0x01) << 7);
+    return t;
+}
+
+/* uncompressed, offset, "compressed", offset */
+int decode(char* s, int o, unsigned char* seq, int seq_off) {
+    int i;
+    unsigned int l = 0; // FIXME: should actually be 0
+    unsigned char n = seq[seq_off + 0] >> 7;
+    /*printf("n is %d\n", n);
+    printf("seq[%x+0] %% 0x80 is %x\n", seq_off, seq[seq_off + 0] % 0x80);*/
+    l = ((int)(seq[seq_off + 0] % 0x80) << 2*8) | ((int)seq[seq_off + 1] << 8) | (int)seq[seq_off + 2];
+    //printf("l is %d is 0x%x\n", l, l);
+    for (i = 0; i < l; i++)
+        s[o+i] = n;
+    return l;
+}
+
+void flush() {
+    outport(RLE_FLUSH_PIO_BASE, 1);
+    //usleep(UTICK);
+    outport(RLE_FLUSH_PIO_BASE, 0);
+}
+
+void hardware_send(unsigned char data) {
+    outport(ODATA_PIO_BASE, data);
+    outport(FIFO_IN_WRITE_REQ_PIO_BASE, 1);
+    //printf("sending %02x\n", data);
+    //usleep(UTICK);
+    outport(FIFO_IN_WRITE_REQ_PIO_BASE, 0);
+    //usleep(UTICK);
+    //flush();
+}
+
+void hardware_rcv(unsigned char* s, int ind) {
+    int input = 0;
+    outport(FIFO_OUT_READ_REQ_PIO_BASE, 1);
+    input = inport(IDATA_PIO_BASE);
+    outport(FIFO_OUT_READ_REQ_PIO_BASE, 0);
+    if (!(ind % 1000))
+        printf("received! @ %x: %x\n", ind, input);
+    s[ind] = (unsigned char)(input >> 16);
+    s[ind+1] = (unsigned char)(input >> 8);
+    s[ind+2] = (unsigned char)input;
+}
+
+/* s = uncompressed, r = "compressed", returns length of "compressed" array */
+int compress(unsigned char* s, int l, unsigned char* r) {
+    int i = 0, rindex = 0;
+   
+    while (i < l) {
+        if (!(i % 1000))
+            printf("i: %x\n", i);
+        while (!inport(RESULT_READY_PIO_BASE)) {
+            hardware_rcv(r, rindex);
+            rindex += 3;
+        }
+        if (inport(FIFO_IN_FULL_PIO_BASE)) {
+            printf("full.\n");
+            //msleep(1000);
+            continue;
+        }
+        hardware_send(s[i++]);
+        //msleep(5000);
+        //usleep(UTICK);
+    }
+    printf("flushing.\n");
+    flush();
+    while (!inport(RESULT_READY_PIO_BASE)) {
+        hardware_rcv(r, rindex);
+        rindex += 3;
+        //usleep(UTICK);
+    }
+    /*printf("empty @ end: %d\n", inport(RESULT_READY_PIO_BASE));
+    printf("finished! \n");
+    printf("full?: %x\n", inport(FIFO_IN_FULL_PIO_BASE));
+    printf("\nresult of compression:\n");
+    print_stream(xtra_smooshed, xtra_index, 0);*/
+    return rindex;
+}
+
+typedef struct {
+    alt_u8 da[6];
+    alt_u8 sa[6];
+    unsigned int crc;
+} eth_frame;
+
+typedef struct {
+    unsigned int src;
+    unsigned int dst;
+    unsigned int len;    // 16 bits, fuck u16
+    alt_u8 proto;
+    unsigned int chksm;  // 16 bits, fuck u16
+} ip_packet;
+
+typedef struct {
+    unsigned int src_ip;
+    unsigned int dst_ip;
+    alt_u16 src_port;
+    alt_u16 dst_port;
+    alt_u16 len;
+    alt_u16 chksm;
+} udp_datagram;
+
+void unpack(alt_u32 p, alt_u8 *u) {
+    u[0] = p >> 3*8;
+    u[1] = (p >> 2*8) & 0x00FF;
+    u[2] = (p >> 8) & 0x0000FF;
+    u[3] = p & 0x000000FF;
+}
+
+unsigned int crc(alt_u8* data, int l) {
+/*    alt_u8 q[l];
+    alt_u8 d[l];
+    alt_u8 quot;
+    int i, j, k;
+    for (i = 0; i < l; i++) {
+        q[i] = data[i];
+        d[i] = 0;
+    }
+    unpack(CRC, d);
+    for (i = 0; i < l-4; i++) {
+        quot = q[i];
+        for (j = 0; j < 8; j++) {
+            if (quot & 0x80) {
+                for (k = 0; k < l; k++)
+                    q[k] ^= d[k];
+                quot = q[i] << j;
+            }
+            shift(d, l);
+            quot <<= 1;
+        }
+    }*/
+    return 0;
+}
+
+alt_u16 checksum(alt_u8* a, int l, int o) {
+    alt_u32 temp = 0; //;
+    int j;
+    for (j = 0; j+1 < l; j+=2) {
+        temp += pack(a[o+j], a[o+j+1]);
+        while ((temp >> 16) == 1) {    // check for overflow
+            temp += 1;
+            temp = temp & 0x0000FFFF;
+        }
+    }
+    return ~(alt_u16)temp;
+}
+
+void make_eth_frame(eth_frame* a, alt_u8* da, alt_u8* sa) {
+    int j;
+    //eth_frame* a = (eth_frame*)malloc(sizeof(eth_frame));
+    for (j = 0; j < 6; j++) {
+        a->da[j] = da[j];
+        a->sa[j] = sa[j];
+    }
+    a->crc = 0;
+}
+
+int pack_eth_frame(eth_frame* ef, alt_u8* s, int l, int o) {
+    int j, cr;
+    alt_u8 c[4];
+    // Destination, source addresses
+    for (j = 0; j < 6; j++) {
+        s[o+j] = ef->da[j];
+        s[o+j+6] = ef->sa[j];
+    }
+    // Ethernet II framing demands 0x0800 at end of MAC header
+    s[o+12] = 0x08;
+    s[o+13] = 0x00;
+    // CRC set to 0 for now (should be 0 anyways)
+    for (j = 0; j < 4; j++)
+        s[l-4+j] = 0x00;
+    // Calculate real CRC
+    cr = crc(s, l);
+    unpack(cr, c);
+//    printf("Packing CRC: %x\n", cr);
+    for (j = 0; j < 4; j++)
+        s[l-4+j] = c[j];
+    // 18 bytes of heady goodness
+    return GOOD;
+}
+
+int unpack_eth_frame(eth_frame* ef, alt_u8* s, int l, int o) {
+    unsigned int j;
+//    printf("Received crc: %x\n", crc(s, l));
+    if (crc(s, l))
+        return BAD_LINK_CRC;
+    for (j = 0; j < 6; j++) {
+        ef->da[j] = s[o+j];
+        ef->sa[j] = s[o+j+6];
+    }
+    if (s[12] != 0x08 || s[13] != 0x00) {
+        printf("s[12] = %x, s[13] = %x\n", s[12], s[13]);
+        return BAD_ETHER_TYPE;
+    }
+    if (l < 64 || l > 1500)
+        return BAD_LINK_SIZE;
+    ef->crc = pack32(s[l-4], s[l-3], s[l-2], s[l-1]);
+    return GOOD;
+}
+
+int pack_ip_packet(ip_packet* pkt, alt_u8* s, int l, int o) {
+    s[o+0] = (IPV<<4 & 0xF0) | (HDR_LEN & 0x0F);
+    s[o+1] = 0x00; //type of service, unused
+    s[o+2] = (alt_u8)(pkt->len >> 8);
+    s[o+3] = (alt_u8)(pkt->len);
+    s[o+4] = (alt_u8)(ID >> 8); // ID (is 5)
+    s[o+5] = (alt_u8)(ID);      // ID (cont)
+    s[o+6] = 0x00;              // flags & fragment offset
+    s[o+7] = 0x00;              // fragment offset (cont)
+    s[o+8] = TTL;               // ttl (16 sec)
+    s[o+9] = pkt->proto;        // proto: udp (17)
+    s[o+10] = 0x00;             // header checksum
+    s[o+11] = 0x00;             // header checksum (cont)
+    s[o+12] = (alt_u8)(pkt->src >> 24);
+    s[o+13] = (alt_u8)(pkt->src >> 16);
+    s[o+14] = (alt_u8)(pkt->src >> 8);
+    s[o+15] = (alt_u8)(pkt->src);
+    s[o+16] = (alt_u8)(pkt->dst >> 24);
+    s[o+17] = (alt_u8)(pkt->dst >> 16);
+    s[o+18] = (alt_u8)(pkt->dst >> 8);
+    s[o+19] = (alt_u8)(pkt->dst);
+    pkt->chksm = (int)checksum(s, IP_HLEN, o);
+    s[o+10] = (alt_u8)(pkt->chksm >> 8);
+    s[o+11] = (alt_u8)(pkt->chksm);
+    return GOOD;
+}
+
+int unpack_ip_packet(ip_packet* pkt, alt_u8* s, int l, int o) {
+    alt_u16 chksm = 0x0000;
+    if (s[o+0] != ((IPV<<4 & 0xF0) | (HDR_LEN & 0xF)))
+        return BAD_IP_VERSION;
+    pkt->len = pack(s[o+2], s[o+3]);
+    if (pkt->len != l)
+        return BAD_IP_LEN;
+    if (pack(s[o+4], s[o+5]) != ID)
+        return BAD_IP_ID;
+    pkt->proto = s[o+9];
+    pkt->chksm = pack(s[o+10], s[o+11]);
+    chksm = checksum(s, IP_HLEN, o);
+    if ((alt_u16)(chksm) != 0x0000)    // coup fourre
+        return BAD_IP_CHKSM;
+    pkt->src = pack32(s[o+12], s[o+13], s[o+14], s[o+15]);
+    pkt->dst = pack32(s[o+16], s[o+17], s[o+18], s[o+19]);
+    return GOOD;
+}
+
+void print_ip_packet(ip_packet* pkt) {
+    printf("ip_packet {\n");
+    printf("\tsrc: %x\n\tdst: %x\n", pkt->src, pkt->dst);
+    printf("\tlen: %x\n\tproto: %x\n", pkt->len, pkt->proto);
+    printf("\tchksm: %x\n}\n", pkt->chksm); 
+}
+
+alt_u16 udp_checksum(udp_datagram* dgm, alt_u8* s, int l, int o) {
+    int j;
+    /* ip psuedo header used for checksum calculation */
+    alt_u8 psh[12 + dgm->len];
+    psh[0] = (alt_u8)(dgm->src_ip >> 3*8);
+    psh[1] = (alt_u8)(dgm->src_ip >> 2*8);
+    psh[2] = (alt_u8)(dgm->src_ip >> 8);
+    psh[3] = (alt_u8)(dgm->src_ip);
+    psh[4] = (alt_u8)(dgm->dst_ip >> 3*8);
+    psh[5] = (alt_u8)(dgm->dst_ip >> 2*8);
+    psh[6] = (alt_u8)(dgm->dst_ip >> 8);
+    psh[7] = (alt_u8)(dgm->dst_ip);
+    psh[8] = 0x00;      // standard says: "Zeroes"!
+    psh[9] = UDP_PROTO;
+    psh[10] = (alt_u8)(dgm->len >> 8);
+    psh[11] = (alt_u8)(dgm->len);
+    /* copy udp datagram header & contents */
+    for (j = 12; j < dgm->len + 12; j++)
+        psh[j] = s[o+j-12];
+    return checksum(psh, 12+dgm->len, 0);
+}
+
+int pack_udp_datagram(udp_datagram* dgm, alt_u8* s, int l, int o) {
+    s[o+0] = (alt_u8)(dgm->src_port >> 8);
+    s[o+1] = (alt_u8)(dgm->src_port);
+    s[o+2] = (alt_u8)(dgm->dst_port >> 8);
+    s[o+3] = (alt_u8)(dgm->dst_port);
+    s[o+4] = (alt_u8)(dgm->len >> 8);
+    s[o+5] = (alt_u8)(dgm->len);
+    s[o+6] = 0x00;  // checksum
+    s[o+7] = 0x00;  // checksum (cont)
+    dgm->chksm = udp_checksum(dgm, s, l, o);
+    s[o+6] = (dgm->chksm >> 8);
+    s[o+7] = (dgm->chksm);
+    return GOOD;
+}
+
+int unpack_udp_datagram(udp_datagram* dgm, alt_u8* s, int l, int o) {
+    alt_u16 chksm;
+    dgm->src_port = pack(s[o], s[o+1]);
+    dgm->dst_port = pack(s[o+2], s[o+3]);
+    dgm->len = pack(s[o+4], s[o+5]);
+    dgm->chksm = pack(s[o+6], s[o+7]);
+    chksm = udp_checksum(dgm, s, l, o);
+    if ((alt_u16)chksm != 0x0000)
+        return BAD_UDP_CHKSM;
+    if (dgm->len != l)
+        return BAD_UDP_LEN;
+    return GOOD;
+}
+
+void print_udp_datagram(udp_datagram* d) {
+    printf("udp_datagram {\n");
+    printf("\tsrc: %x:%x\n", d->src_ip, d->src_port);
+    printf("\tdst: %x:%x\n", d->dst_ip, d->dst_port);
+    printf("\tlen: %x\n\tchksm: %x\n}\n", d->len, d->chksm);
+}
+/* arr, here be dragons */
+
+int check_eth(eth_frame* ef) {
+    int j;
+    /* check addresses */
+    for (j = 0; j < 6; j++) {
+        if ((ef->da[j] != ether_addr[j]) ||
+            (ef->sa[j] != remote_addr[j])) {
+//            printf("bad_link_addr @ j: %d\n", j);
+            return BAD_LINK_ADDR;
+        }
+    }
+    return GOOD;
+}
+
+int check_ip(ip_packet* ip) {
+    if (ip->src != REMOTE_ADDR)
+        return BAD_SRC_IP;
+    if (ip->dst != LOCAL_ADDR)
+        return BAD_DST_IP;
+    if (ip->proto != UDP_PROTO)
+        return BAD_IP_PROTO;
+    return GOOD;
+}
+
+int check_udp(udp_datagram* dgm) {
+    if (dgm->src_port != REMOTE_PORT)
+        return BAD_UDP_SRC_PORT;
+    if (dgm->dst_port != LOCAL_PORT)
+        return BAD_UDP_DST_PORT;
+    return GOOD;
+}
+
+int check_layers(alt_u8* s, int l) {
+    eth_frame ef;
+    ip_packet ip;
+    udp_datagram dgm;
+    int r, len, o;
+    len = l;
+    o = 0;
+    r = unpack_eth_frame(&ef, s, len, o);
+    if (r)
+        return r;
+    r = check_eth(&ef);
+    if (r)
+        return r;
+    len -= (LINK_HLEN + LINK_TLEN);
+    o += LINK_HLEN;
+    r = unpack_ip_packet(&ip, s, len, o);
+    dgm.src_ip = ip.src;
+    dgm.dst_ip = ip.dst;
+    if (r)
+        return r;
+    r = check_ip(&ip);
+    if (r)
+        return r;
+    len -= IP_HLEN;
+    o += IP_HLEN;
+    r = unpack_udp_datagram(&dgm, s, len, o);
+    if (r)
+        return r;
+    r = check_udp(&dgm);
+    if (r)
+        return r;
+    return GOOD;
+}
+
+/* you are responsible to ensure that pl_len is at least MIN_LINK_SIZE (46) bytes long */
+// You are also responsible to ensure that stream has header and trailer padding.
+
+int send_packet(alt_u8* stream, int pl_len, alt_u8* link_addr, unsigned int ip, alt_u16 port) {
+    int o, r, l;
+    //int size = LINK_HLEN + IP_HLEN + UDP_HLEN + pl_len + LINK_TLEN;
+    //alt_u8 stream[size];
+    udp_datagram dgm;
+    ip_packet pkt;
+    eth_frame ef;
+    
+    wait_for_l2ack = 1;
+    
+    /* copy payload */
+    /*o = off + LINK_HLEN + IP_HLEN + UDP_HLEN;
+    for (j = 0; j < pl_len; j++) 
+        stream[o+j] = pl[j];*/
+    
+    /* write udp header */
+    o = LINK_HLEN + IP_HLEN;
+    r = 0;
+    l = UDP_HLEN + pl_len;
+    dgm.src_ip = LOCAL_ADDR;
+    dgm.dst_ip = ip;
+    dgm.src_port = LOCAL_PORT;
+    dgm.dst_port = port;
+    dgm.len = l;
+    r = pack_udp_datagram(&dgm, stream, l, LINK_HLEN + IP_HLEN);
+    if (r) {
+        //printf("failure packing udp_datagram: %x\n", r);
+        return r;
+    }
+//    print_udp_datagram(&dgm);
+    /* ip header */
+    o = LINK_HLEN;
+    r = 0;
+    l += IP_HLEN;
+    pkt.src = LOCAL_ADDR;
+    pkt.dst = ip;
+    pkt.len = l;
+    pkt.proto = UDP_PROTO;
+    r = pack_ip_packet(&pkt, stream, l, o);
+    if (r) {
+//        printf("failure packing ip_packet: %x\n", r);
+        return r;
+    }
+//    print_ip_packet(&pkt);
+    
+    /* ethernet frame */     
+    r = 0;
+    l += LINK_HLEN + LINK_TLEN;
+    make_eth_frame(&ef, link_addr, ether_addr);
+//    print_eth_frame(&ef);
+    r = pack_eth_frame(&ef, stream, l, 0);
+    if (r) {
+//        printf("Searealiseasatioon failed.\n");
+        return r;
+    }
+    print_stream(stream, l, 0);
+    printf("sending...\n");
+    TransmitPacket(stream, l);
+    return GOOD;
+}
+
+int sample_msg() {
+    static int message = 0;
+    int ws = inport(SWITCH_PIO_BASE);
+//    printf("write_switch: %x\n", ws);
+    /* sample when sw17 is high */ 
+    if (ws>>17 == 1) {
+        message = inport(SWITCH_PIO_BASE);
+//        printf("message: %x\n", (alt_u16)message);
+        outport(LED_BASE, message);
+    }
+    return message;
+}
+
+void unpack_picture(){
+    
+    int k;
+    k = 0;
+    
+    while(k < IMG_SIZE){
+        img[k*8] = smooshed_pic[k] & 0x01;
+        img[k*8+1] = (smooshed_pic[k] & 0x02)>>1;
+        img[k*8+2] = (smooshed_pic[k] & 0x04)>>2;
+        img[k*8+3] = (smooshed_pic[k] & 0x08)>>3;
+        img[k*8+4] = (smooshed_pic[k] & 0x10)>>4;
+        img[k*8+5] = (smooshed_pic[k] & 0x20)>>5;
+        img[k*8+6] = (smooshed_pic[k] & 0x40)>>6;
+        img[k*8+7] = (smooshed_pic[k] & 0x80)>>7;
+        
+        k++;
+    }
+}
+
+int receive_image(alt_u8* s, int l, int o) {
+    int j;
+    //printf("adding to rcv_img @ %x\n", (count) * (l-o-4));
+//    print_stream(s, l-o-4, o);
+    printf("\n packet number: %d\n", s[o]);
+    if(s[o] == ACK){
+        //unpack_picture();
+        int purple = 0, offset = 0;
+        while (offset+2 < rlen) {
+            purple += decode(uncomp_img, purple, smooshed_pic, offset);
+            offset += 3;
+        }
+        /*printf("about to display uncomp_img\n");
+        printf("rlen, purple:  %x, %x\n", rlen, purple);
+        printf("printing uncomp_img\n");
+        print_stream(uncomp_img, RAW_IMG_SIZE,0);
+        printf("printing rle_img\n");
+        print_stream(rle_img, rlen,0);*/
+        int i;
+        for(i = 0; i < RAW_IMG_SIZE; i++){
+           if(uncomp_img[i] != 0){
+            printf("we have a nonzero data point, breaking from this check\n");
+            break;
+           }
+        }
+        vga_display(uncomp_img);
+        //vga_display(img);
+        printf("hi walter\n");
+        count = 0;
+        return GOOD;
+    }
+    if(s[o] == NAK){
+        return GOOD;
+    }
+    for (j = 1; j < l-o; j++)
+        smooshed_pic[(s[o]*(l-o-1))+(j-1)] = s[o+j];
+/*    if (c->last) {
+        clear_screen();
+//        r = 0;
+//        r = verify_image(rcv_img);
+        
+        printf("Verification: %x\n", r);
+    }*/
+    return GOOD;
+}
+
+int send_command(alt_u8 cmd) {
+    int j, r, o;
+    alt_u8 stream[MIN_LINK_SIZE+HEADERS];
+    r = 0;
+    o = LINK_HLEN + IP_HLEN + UDP_HLEN;
+//    r = pack_command(c, stream, 0, o);
+//    print_command(c);
+//    printf("we should have sent that\n");
+//    if (r)
+//        return r;
+    stream[o] = cmd;
+    //printf("cmd: %d\n", cmd);
+    for (j = o + 1; j < o + MIN_LINK_SIZE; j++)
+        stream[j] = 0xFF;//padding
+    
+    r = send_packet(stream, MIN_LINK_SIZE, remote_addr, REMOTE_ADDR, REMOTE_PORT);
+    if (r)
+        return r;
+    return GOOD;
+}
+
+int board_mode() {
+    int ws = inport(SWITCH_PIO_BASE);
+    //printf("write_switch: %x\n", ws);
+    if (ws>>17 == 1) {
+        return MASTER;
+    }
+    return SLAVE;
+}
+
+int nack(alt_u8 nack) {
+    int r = GOOD;
+    r = send_command(nack);
+    printf("-> ACK %d\n", nack);
+    chunk = -1;
+    if(nack == NAK){
+        outport(LED_BASE, 0x3FFFF);
+        usleep(5000);
+        outport(LED_BASE, 0);
+    } else {
+        outport(LED_GREEN_BASE, 0xFF);
+        usleep(5000);
+        outport(LED_GREEN_BASE, 0);
+    }
+    return r;
+}
+
+void handle_command(alt_u8 cmd) {
+//    printf("I am in handle_command()\n");
+    if (cmd != ACK && cmd != NAK) {
+//        printf("SEND: %d \n", SEND);
+//        printf("cmd: %x \n", cmd);
+        int mode = board_mode();
+//        printf("board_mode(): %d\n", mode);
+        if ((cmd >= SEND) && (cmd <= 0x17) && (mode == 1)) {
+//            printf("We ought to ack...\n");
+            nack(ACK);
+            //do command
+            is_cmd = 1;
+        } else {
+            nack(NAK);
+        }
+    } else if (cmd == ACK) {
+         //clear_screen();
+//        r = 0;
+//        r = verify_image(rcv_img);
+        unpack_picture();
+//        printf("Verification: %x\n", r);
+        //vga_display(smooshed_pic);
+//        printf("ACK!\n");
+    } else if (cmd == NAK) {
+//        printf("NAK!\n");
+    } else {
+//        printf("shit.\n");
+    }
+        
+}
+
+int link_ack(alt_u8* s, int l) {
+    if (L2ACK == s[LINK_HLEN]) {
+//        for (j = LINK_HLEN+1; j < l; j++)
+//            if (0xFF != s[j])
+//                return 0;
+        l2ack = 1;
+        chunk++;
+        return 1;
+    }
+    return 0;
+}
+
+int send_link_ack() {
+    int j, r, l;
+    alt_u8 stream[MIN_LINK_SIZE+LINK_HLEN+LINK_TLEN];
+    eth_frame ef;
+    make_eth_frame(&ef, remote_addr, ether_addr);
+    l = LINK_HLEN + LINK_TLEN + MIN_LINK_SIZE;
+    r = pack_eth_frame(&ef, stream, l, 0);
+    if (r)
+        return r;
+    stream[LINK_HLEN] = L2ACK;
+    for (j = LINK_HLEN+1; j < l; j++)
+        stream[j] = 0xFF;
+//    usleep(5000);    
+    TransmitPacket(stream, l);
+    printf("-> l2ack\n");
+    return GOOD;
+}
+
+void ethernet_interrupts() {
+    int invalid, rcv, pld, r;
+    alt_u8 msg_in;
+    packet_num++;
+    int slave = board_mode();
+    aaa = ReceivePacket(RXT, &rx_len);  // why the fuck is this named 'aaa'?
+    if (aaa) {
+        //printf("invalid packet received: %x\n", aaa);
+        return;
+    }
+    printf("<================================>\n");
+    printf("Receive Packet Length = %x\n", rx_len);
+    if (1){
+        print_stream(RXT, rx_len, 0);
+        outport(SEG7_DISPLAY_BASE, rx_len);}
+    r = 0;
+    r = link_ack(RXT, rx_len-4);
+    if (r) {
+    //    printf("LINK LAYER ACK\n");
+        return;
+    }
+    rcv = inport(SWITCH_PIO_BASE);
+   // printf("rcv: %x\n", rcv);
+    if ((rcv & 0x00001000) == 0) {
+        send_link_ack();
+    } else {
+   //     printf("We are evil, we send NO LINK ACK.\n");
+    }
+    invalid = check_layers(RXT, rx_len-4);
+    if (invalid) {
+   //     printf("message is BAD: %x\n", invalid);
+        return;
+    }
+    pld = LINK_HLEN + IP_HLEN + UDP_HLEN;
+    msg_in = RXT[pld];
+//    command c;
+  //  printf("considering\n");
+    print_stream(RXT, 3, pld);
+//    unpack_command(&c, RXT, rx_len, pld);
+//    print_command(&c);
+    outport(SEG7_DISPLAY_BASE, packet_num);
+    if(slave){
+//        printf("I am your slave!\n");
+        command = msg_in;
+        handle_command(command);
+    } else {
+        receive_image(RXT, rx_len-8, pld);
+    }
+    //printf("<================================>\n");
+}
+
+int transmit_image(alt_u8* pic, int l, int o, int chunk_size, int chunk_num) {
+    int i, j, r, block;
+    block = chunk_size - CMD_HLEN;
+    alt_u8 stream[chunk_size+HEADERS];
+    o = HEADERS - LINK_TLEN;
+    i = chunk_num * block;
+        if (i + block > l) {
+            transmit = 0;
+        }
+        stream[o] = chunk_num;
+        r = 0;
+        for (j = i; ((j-i < block) && (j < l)); j++)
+            stream[o+1+j-i] = pic[j];
+        if (j == l) {
+//            printf("We're padding out the last packet.\n");
+            for (j = l; j-i < block; j++)
+                stream[o+1+j-i] = 0xFF;
+        }
+//        print_stream(stream, chunk_size+HEADERS, 0);
+        printf("chunk number: %d\n", chunk_num);
+        r = send_packet(stream, chunk_size, remote_addr, REMOTE_ADDR, REMOTE_PORT);
+        if (r)
+            return r;
+    return GOOD;
+}
+
+alt_u8* pack_picture(alt_u8 *pic_array) {
+    int k;
+    for (k = 0; k < IMG_SIZE; k++)
+        smooshed_pic[k] = 0x00;
+    for (k = 0; k < IMG_SIZE; k++) {
+        smooshed_pic[k] = pic_array[k*8] | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+1]<<1 | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+2]<<2 | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+3]<<3 | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+4]<<4 | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+5]<<5 | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+6]<<6 | smooshed_pic[k];
+        smooshed_pic[k] = pic_array[k*8+7]<<7 | smooshed_pic[k];
+    }
+    return smooshed_pic;
+}
+
+int main(void) {
+    printf("Dwarven epoch: 73\n");
+    int c, mode;
+    int sent = 0;
+    int switches;
+    
+    alt_u8 padding;
+    clear_screen();
+    DM9000_init();
+    
+    alt_irq_register(DM9000A_IRQ, NULL, (void*)ethernet_interrupts); 
+    ack = 0;
+    l2ack = 0;
+    is_cmd = 0;
+    packet_num = 0;
+    transmit = 0;
+    chunk = -1;
+    
+    vga_init();  
+    test_vga();
+    
+    padding = 0x00;
+    
+    mode = board_mode();
+    if(mode == SLAVE){
+       // int rlen, i, purple = 0, offset = 0;
+        test_vga();
+        read_flash(raw_img);
+        pack_picture(raw_img);
+        printf("Picture has been smooshed.\n");
+        //int rlen, i, purple = 0, offset = 0;
+        rlen = compress(smooshed_pic, IMG_SIZE, rle_img);
+        printf("Picture has been compressed, length rlen: %x\n", rlen);
+        /*int j;
+        for (j = 0; j < IMG_SIZE; j++) {
+            if (smooshed_pic != 0) {
+                printf("it'snonallzero\n");
+                break;
+            }
+        }
+        print_stream(smooshed_pic, IMG_SIZE, 0)*/
+       /* printf("read, displaying & compressing\n");
+        vga_display(raw_img);
+        pack_picture(raw_img);
+        rlen = compress(smooshed_pic, IMG_SIZE, rle_img);
+        //rlen = compress(testArray, TALEN, rle_img);
+        printf("finished compression, rlen: %x\n", rlen);
+        while (offset+2 < rlen) {
+            purple += decode(uncomp_img, purple, rle_img, offset);
+            offset += 3;
+        }
+        printf("purple is %x\n", purple);
+        for (i = 0; i < rlen; i++) {
+            if (uncomp_img[i] != raw_img[i]) {
+                printf("error @ %x: %x != %x\n", i, uncomp_img[i], raw_img[i]);
+                if (!(i % 1000))
+                    printf(": %x\n", uncomp_img[i]);
+                //break;
+            }
+        }*/
+        
+        vga_display(raw_img);
+    }
+    printf("fin.\n");
+    while (1) {
+        c = 0;
+        switches = inport(SWITCH_PIO_BASE);
+        if (mode == MASTER) {
+            if (switches & 0x00000010) {
+                if (!sent) {
+//                    printf("switch is good!\n");
+                    send_command((alt_u8) switches);
+                    sent = 1;
+                    continue;
+                } else {
+                   // printf("switch is too high\n");
+                }
+            } if ((switches & 0x00000010) == 0) {
+                //printf("switch went low, reset\n");
+                sent = 0;
+            }
+            if (switches & 0x00000100) {
+                clear_screen();
+            }
+        } else if (mode == SLAVE) {
+            if (transmit) {
+                //transmit_image(testArray, TALEN, 0, 46 /*1440*/, chunk);
+                transmit_image(rle_img, rlen, 0, MAX_LINK_SIZE, chunk);
+                //transmit_image(rle_img, rlen, 0, 1440, chunk);
+            } else if (chunk*1439 > IMG_SIZE){
+                chunk = -1;
+                nack(ACK);
+            }
+            if (is_cmd) {
+                switch (command) {
+                    case 0x0:
+                        //read_flash(img);
+//                        printf("case 0\n");
+                        break;
+                    case SEND:
+//                        printf("I estimate 0x%x packets...\n", (int)(IMG_SIZE / MIN_LINK_SIZE));
+                        //transmit_image(smooshed_pic, IMG_SIZE, 0, MIN_LINK_SIZE+16, 0);
+//                        printf("case 1\n");
+                        break;
+                    case INVERT:
+                        invert_img(img);
+//                        printf("case 2\n");
+                        break;
+                    case ROTATE:
+                        rotate_img(img);
+//                        printf("case 3\n");
+                        break;
+                    case MIRROR:
+                        mirror_img(img);
+//                        printf("case 4\n");
+                        break;
+                    case EDGE:
+                        edge_detect(img);
+//                        printf("case 5\n");
+                        break;
+                    case TIMESTAMP:
+                        set_time(img);
+//                        printf("case 6\n");
+                        break;
+                    case 0x7:
+//                        printf("case 7\n");
+                        break;
+                    default:
+//                        printf("bad case!\n");
+                        break;
+                }
+                transmit = 1;
+                //vga_display(img);
+                //pack_picture(img);
+                //int rlelen = compress(smooshed_pic, IMG_SIZE, rle_img);
+                //printf("finished compression, rlen: %x\n", rlelen);
+//                printf("We got the command:\n");
+//                print_command(&rcv_cmd);
+                is_cmd = 0;
+            }
+        }
+        msleep(TICK);
+    }
+    return 0;
+}
