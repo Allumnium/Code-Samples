@@ -1,0 +1,576 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+
+public class GameLogic : MonoBehaviour
+{
+    //This game is similar to the classic card game "War" except that each player gets a hand of cards, and some cards
+    //      have unique abilities. Also, each turn all players discard a card into their treasury. The treasury is surrended to
+    //      whomever defeats that player in war.
+
+    //Each phase of the game is its own thread in an endless loop, the enum controls which phase is active.
+    //      Each phase hands off to the next phase as needed. This is done to allow for WaitForSeconds() or WaitUntil() 
+    //      commands which require use of coroutines.
+
+    public enum phase { setup, upkeep, action, evaluateAction, evaluateRound, gameEnd, undefined };
+    public phase curPhase = phase.undefined;
+
+    //Typical Phase Progression:
+    //0 Setup               
+    //  Round
+    //1      upkeep phase
+    //2      action phase
+    //3      evaluateAction (returns to action if an action is required by any players)
+    //4      evaluateRound (may go back to action phase during war)
+    //5 Cleanup
+    //6 GameEnd
+
+    //Requires drag and drop of a Gameobject in the editor:
+    public GameObject settings;
+    public GameObject deckBox_g;
+    public GameObject chatTextBox;
+    public GameObject chatVerticalScrollbar_g;
+    public AudioSource victorySound;
+    //
+
+    //referenced by other classes:
+    public int roundNum;
+    public int activePlayerNum;
+    public List<Player> players = new List<Player>();
+    //
+
+    public bool givePrizeStackToWinner;
+    public int numPlayersAtWar;
+    
+    private bool noMoreWarThisRound, negateDragon, removePrizePoolAtEndOfRound, skipTurn;
+    private int numDefeatedPlayers, activePlayerIndex;
+    private Player roundWinner;
+    private CardStack deckBox;
+    private TMPro.TextMeshProUGUI chatTextContent;
+    private bool isWaiting = false;
+    private Scrollbar chatVerticalScrollbar;
+
+    void Start()
+    {
+        deckBox = deckBox_g.GetComponent<CardStack>();
+        roundNum = 0;
+        chatTextContent = chatTextBox.GetComponent<TMPro.TextMeshProUGUI>();
+        chatVerticalScrollbar = chatVerticalScrollbar_g.GetComponent<Scrollbar>();
+
+        foreach (Player p in players)
+        {
+            p.prizeStack = p.prizeStack_g.GetComponent<CardStack>();
+        }
+
+        StartCoroutine(setupPhase());
+        StartCoroutine(upkeepPhase());
+        StartCoroutine(actionPhase());
+        StartCoroutine(evaluationPhase());
+        StartCoroutine(cleanupPhase());
+        StartCoroutine(gameEndPhase());
+    }
+
+    public void chatWrite(string input)
+    {
+        DateTime d = DateTime.Now;
+        chatTextContent.text += d.Hour.ToString() + ":" + d.Minute + ":" + d.Second + "\t" + input + "\r\n";
+        chatVerticalScrollbar.value = 0;//autoscroll to the new message
+    }
+  
+    private void updateNumDefeatedPlayers()
+    {
+        numDefeatedPlayers = players.FindAll(p => p.isDefeated).Count;
+    }
+
+    private void applyCardEffects_immediate()
+    {
+        if (players[activePlayerIndex].activeCardStack.cards.Count == 0) return;
+        switch (players[activePlayerIndex].activeCard_g.GetComponent<CardStack>().cards[0].value)
+        {
+            case 1: //DRAGON
+                noMoreWarThisRound = true;
+                players.ForEach(x => x.isAtWar = false);//end all wars and prevent future wars for the round
+                chatWrite("Player " + activePlayerNum + " played a dragon. (Remove the discard " +
+                    "pile from the game and negate all wars for the rest of the turn. If there is " +
+                    "a tie, then the player who went first this round gets +1 power");
+                
+                break;
+            case 2: //GUARD
+                
+                chatWrite(players[activePlayerNum].playerName + " played a guard. (effect: +2 to next card played)");
+                //guard only works if there is another card available to play, otherwise it remains the active card
+                if (players[activePlayerIndex].getNumCardsInHand() > 0 || players[activePlayerIndex].deck.cards.Count > 0 && !players[activePlayerIndex].hasGuard)
+                {
+                    players[activePlayerIndex].hasGuard = true;
+                    players[activePlayerIndex].activeCard_g.GetComponent<CardStack>().moveTo(players[activePlayerIndex].prizeStack_g.GetComponent<CardStack>(), 1);
+                    players[activePlayerIndex].actionRequired = true;
+                }
+                break;
+            case 4: //MILITIA
+                chatWrite(players[activePlayerNum].playerName + " played a militia. (effect: Each opponent discards a card)");
+                foreach (Player b in players)
+                {
+                    if (b != players[activePlayerIndex])
+                    {
+                        b.deck.moveTo(b.prizeStack, 1);
+                    }
+                }
+                break;
+            case 7: //KNIGHT
+                chatWrite(players[activePlayerNum].playerName + " played a knight. (effect: Negate the effect of dragons");
+                negateDragon = true;
+                break;
+            case 9: //WIZARD
+                chatWrite(players[activePlayerNum].playerName + " played a wizard. (effect: Draw a new hand");
+                foreach (GameObject cs_g in players[activePlayerIndex].hand_g)
+                {
+                    CardStack cs = cs_g.GetComponent<CardStack>();
+                    cs.moveTo(players[activePlayerIndex].deck, 1);
+                    players[activePlayerIndex].deck.shuffle();
+                    StartCoroutine(players[activePlayerIndex].drawHand());
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    IEnumerator delay(float t)//if used with a waitUntil(!isWaiting) or while(isWaiting), this allows a delay even in threads which aren't Coroutines
+    {
+        isWaiting = true;
+        yield return new WaitForSeconds(t);
+        isWaiting = false;
+    }
+
+    private void applyCardEffects_roundEnd()
+    {
+        for (int i = 0; i < players.Count; i++)
+        {
+            if (players[i].activeCard_g.GetComponent<CardStack>().cards.Count > 0)
+            {
+                switch (players[i].activeCard_g.GetComponent<CardStack>().cards[0].value)
+                {
+                    case 1: //DRAGON
+                        chatWrite("Discard pile removed by the dragon!");
+                        foreach (Player p in players)
+                        {
+                            while (p.prizeStack.cards.Count > 0)
+                            {
+                                p.prizeStack.moveTo(deckBox, 1);
+                                StartCoroutine(delay(1.0f));
+                                while (isWaiting) { }
+                            }
+                        }
+                        break;
+                    case 14: //GENERAL
+                        if (!players[i].isAtWar) players[i].power -= 13;//resets the General card's power
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+
+    private void doWar()
+    {
+        if (noMoreWarThisRound)
+        {
+            return;
+        }
+        foreach (Player p in players)
+        {
+            if (p.isAtWar)
+            {
+                p.actionRequired = true;
+                if (p.deck.cards.Count > 0 || p.getNumCardsInHand() > 0)//pay if you can afford to
+                {
+                    p.activeCard_g.GetComponent<CardStack>().moveTo(p.prizeStack, 1);
+                }
+                for (int i = 0; i < 2; i++)//this magic number 2 is the war's card cost. Maybe this should be a variable
+                {
+                    p.deck.moveTo(p.prizeStack, 2);//if player doesn't have enough, moveTo will fail silently with no penalty for that player
+                }
+            }
+        }
+    }
+
+    private void updateWarStatus()
+    {
+        players.ForEach(p => p.isAtWar = false);
+        numPlayersAtWar = 0;
+        if (noMoreWarThisRound)
+        {            
+            return;
+        }
+        List<Player> tmpPlayerList = new List<Player>();
+        foreach (Player p in players)
+        {
+            
+            if(p.activeCardStack.cards.Count > 0) {
+                foreach (Player b in players)
+                {
+                    if (b.activeCardStack.cards.Count > 0)
+                    {
+                        if ((p != b) && (b.power == p.power))
+                        {
+                            if (!tmpPlayerList.Contains(p)) tmpPlayerList.Add(p);
+                            p.isAtWar = true;
+                            p.wasAtWar = true;
+                            numPlayersAtWar++;
+                            givePrizeStackToWinner = true;
+                        }
+                    }
+                }//end of foreach b
+            }
+        }
+
+        if (tmpPlayerList.Count >= 2)
+        {
+            string tmp = "";
+            int i = 0;
+            foreach (Player q in tmpPlayerList)
+            {
+                if(i == tmpPlayerList.Count - 2)
+                {
+                    tmp += q.playerName + " and ";
+                }
+                else if(i == tmpPlayerList.Count)
+                {
+                    tmp += q.playerName;
+                }
+                else
+                {
+                    tmp += q.playerName + ", ";
+                }
+                i++;
+                
+            }
+            chatWrite(tmp + " are at war!");
+        }
+
+        Debug.Log("updated war status");
+    }
+
+    private void updateGeneralPower()
+    {
+        foreach(Player b in players)
+        {
+            
+            if (b.activeCardStack.cards.Count == 0) continue;
+            Debug.Log("cardx: " + b.getActiveCard().name);
+            if (b.wasAtWar && b.getActiveCard().name.Contains("card 0")) b.getActiveCard().value = 14;//buff the general if no war active
+            else if(!b.wasAtWar && b.getActiveCard().name.Contains("card_0")) b.getActiveCard().value = 0;
+        }
+    }
+
+    private void evaluateNewCard()
+    {
+        applyCardEffects_immediate();
+        updateWarStatus();
+        updateGeneralPower();
+        updateCurrentWinner();
+    }
+
+    private void updateCurrentWinner()
+    {
+        //get the value of the highest card and determine which player has that card
+        players.ForEach(x => x.hasHighestCard = false);// first reset all highestCard flags on the players
+        int highestCardPower = -1;
+        int tmp = -1;
+        int winnerIndex = -1;
+        for (int i = 0; i < players.Count; i++)
+        {
+            if (players[i].activeCardStack.cards.Count > 0)
+            {
+                tmp = players[i].power;
+                if (tmp > highestCardPower)
+                {
+                    highestCardPower = tmp;
+                    winnerIndex = i;
+                }
+            }
+        }
+        if (winnerIndex == -1) return; //if there was no winner yet, then ignore this
+        players[winnerIndex].hasHighestCard = true;
+        roundWinner = players[winnerIndex];
+    }
+
+    private void resetAce(Card c)
+    {
+        if (c == null) return;
+        if (c.value == 14)
+        {
+            c.value = 0;
+        }
+    }
+
+    private void resetRound()
+    {
+        players.ForEach(p => p.maxHandSize = 3);
+        players.ForEach(p => StartCoroutine(p.drawHand()));
+        players.ForEach(x => x.isAtWar = false);
+        players.ForEach(x => x.wasAtWar = false);
+        players.ForEach(x => x.hasHighestCard = false);
+        players.ForEach(x => x.chosenCardStack = null);
+        players.ForEach(x => x.power = 0);
+        players.ForEach(x => x.hasGuard = false);
+        
+        //set the power of all ace cards in all decks and hands back to 0
+        /*foreach (Player p in players)
+        {
+            foreach (Card c in p.deck.cards)
+            {
+                if (p.deck.cards.Count > 0)
+                    resetAce(c);
+            }
+            foreach (GameObject g in p.hand_g)
+            {
+               for(int i = 0; i < 2; i++)
+                {
+                    if(g.GetComponent<CardStack>().cards.Count > 0)
+                        resetAce(g.GetComponent<CardStack>().cards[0]);
+                }
+            }
+        }*/
+        //players.ForEach(x => x.deck.cards.ForEach(y => resetAce(y)));
+        //players.ForEach(x => x.hand_g.ForEach(y => resetAce(y.GetComponent<CardStack>().cards[0])));
+        givePrizeStackToWinner = false;
+        noMoreWarThisRound = false;
+        roundWinner = null;
+        activePlayerIndex = players.Find(x => x.goesFirst == true).playerNum - 1;
+        negateDragon = false;
+        noMoreWarThisRound = false; //triggered by the dragon
+        removePrizePoolAtEndOfRound = false;
+        roundNum++;
+        chatWrite("Starting Round " + roundNum);
+    }
+
+
+    IEnumerator setupPhase()
+    {
+        curPhase = phase.setup;
+        //initialize the players
+
+        deckBox.assignStartingDeck();
+
+        //assign a second deck
+        deckBox_g.GetComponent<CardStack>().cards.AddRange(deckBox_g.GetComponent<CardStack>().cards);
+        //deckBox_g.GetComponent<CardStack>().cards.AddRange(deckBox_g.GetComponent<CardStack>().cards);
+        //deckBox_g.GetComponent<CardStack>().cards.AddRange(deckBox_g.GetComponent<CardStack>().cards);
+
+        deckBox.shuffle();
+        yield return new WaitForSeconds(2f);
+        while (deckBox.cards.Count > 0)
+        {
+            foreach (Player p in players)
+            {
+                deckBox.moveTo(p.deck, 1);
+                yield return new WaitForSeconds(0.025f);
+            }
+        }
+
+        settings = GameObject.Find("LocalPlayerSettings");
+        classCardBonus cb = settings.GetComponent<classCardBonus>();
+        Debug.Log("winning");
+        cb.giveBonusCards();
+
+        foreach (Player p in players)
+        {
+            p.deck.shuffle();
+        }
+        //decide who starts
+        activePlayerNum = UnityEngine.Random.Range(0, players.Count);
+        players[activePlayerNum].goesFirst = true;
+        
+        curPhase = phase.upkeep;
+        yield return null;
+    }
+
+    IEnumerator upkeepPhase()
+    {
+        while (curPhase != phase.gameEnd)
+        {
+            yield return new WaitUntil(() => curPhase == phase.upkeep);
+            curPhase = phase.upkeep;
+            resetRound();//includes drawing
+            yield return new WaitForSeconds(1);
+            Debug.Log("UPKEEP PHASE");
+            //each player must pay a card from their deck to the middle. If they cannot then they lose the game
+            foreach (Player p in players)
+            {
+                if (p.deck.cards.Count == 0)
+                {
+                    p.isDefeated = true;
+
+                }
+            }
+            updateNumDefeatedPlayers();
+            if (numDefeatedPlayers == players.Count - 1)
+            {
+                curPhase = phase.gameEnd; //check for all players except one being eliminated:
+                yield return null;
+                break;
+            }
+            foreach (Player p in players)
+            {
+                p.deck.moveTo(p.prizeStack, 1);
+                yield return new WaitForSeconds(0.2f);
+            };
+
+            //a player is required to act if they are not defeated and dont have an active card
+            players.ForEach(x => x.actionRequired = ((x.activeCardStack.cards.Count == 0) && !x.isDefeated));
+            curPhase = phase.action;
+        }
+    }
+
+    IEnumerator actionPhase()
+    {
+        while (curPhase != phase.gameEnd)
+        {
+            yield return new WaitUntil(() => curPhase == phase.action);
+            int i = activePlayerIndex;
+            //chatWrite(players[activePlayerIndex].playerName + "'s turn");
+            players.ForEach(x => x.chosenCardStack = null);//reset their chosen card
+            if (players[i].actionRequired)
+            {
+                players[i].isMyTurn = (i == activePlayerIndex);
+                //CHOOSE THE CARD
+               
+                if (players[i].getNumCardsInHand() > 0)//if they have a hand, then play from it
+                {
+                    if (players[i].isComputerPlayer)
+                    {
+                        ComputerAI.playLowestCard(players[i]);
+                    }
+                    players[i].isMyTurn = true;
+                    yield return new WaitUntil(() => players[i].chosenCardStack != null || players[i].skippedTurn);
+                }//if no hand, then play from top of deck
+                else
+                {
+                    players[i].chosenCardStack = players[i].deck;
+                }
+
+                if (!players[i].skippedTurn)
+                {
+                    //PLAY THE CARD
+                    players[i].chosenCardStack.moveTo(players[i].activeCardStack, 1);
+
+                    //ADD CARD POWER
+                   
+                    if (players[i].hasGuard)
+                    {//had guard bonus from previous chosen card
+                        Debug.Log("i: " + i);
+                        Debug.Log("player num: " + players[i].playerName);
+                        Debug.Log("power: " + players[i].power);
+                        Debug.Log("activeCardCount: " + players[i].activeCardStack.cards.Count);
+                        players[i].power = players[i].activeCardStack.cards[0].value + 2;
+                    }
+                    else
+                    {
+                        players[i].power = players[i].activeCardStack.cards[0].value;
+                    }
+
+                    Debug.Log("Player " + players[i].playerName + " has selected their active card!");
+                }
+                else
+                {
+                    players[i].deck.moveTo(players[i].prizeStack, 1);
+                    Debug.Log("Player " + players[i].playerName + " skipped their turn");
+                }
+            }
+            players[i].actionRequired = false;
+            curPhase = phase.evaluateAction;
+        }
+    }
+
+    IEnumerator evaluationPhase()
+    {
+        while (curPhase != phase.gameEnd)
+        {
+            yield return new WaitUntil(() => curPhase == phase.evaluateAction);
+            evaluateNewCard(); //always evaluate the newly played card
+
+            if (!players[activePlayerIndex].actionRequired)
+            {
+                players[activePlayerIndex].isMyTurn = false;
+                players[activePlayerIndex].skippedTurn = false;
+                activePlayerIndex = (activePlayerIndex + 1) % players.Count;
+            }
+
+            // End of round Evaluation Effects
+            if (!players.Find(x => x.actionRequired == true))//if no player has an action to make, then evaluate end of round conditions
+            {
+                applyCardEffects_roundEnd();
+                yield return new WaitForSeconds(0.2f);
+                doWar();
+                yield return new WaitForSeconds(0.2f);
+            }
+
+            yield return new WaitForSeconds(0.3f);
+            if (!players.Find(x => x.actionRequired == true))//if still no player has an action to make, then cleanup
+            {
+                curPhase = phase.evaluateRound;
+            }
+            else
+                curPhase = phase.action;
+        }
+    }
+
+    
+
+    IEnumerator cleanupPhase()
+    {
+        while (curPhase != phase.gameEnd)
+        {
+            yield return new WaitUntil(() => curPhase == phase.evaluateRound);
+            Debug.Log("cleanup phase");
+            yield return new WaitForSeconds(1);
+            updateWarStatus();
+            if (givePrizeStackToWinner)
+            {
+                Debug.Log("giving prize to war victor");
+                foreach (Player p in players)
+                {
+                    if (p.wasAtWar)
+                    {
+                        p.prizeStack_g.GetComponent<CardStack>().shuffle();
+                        while (p.prizeStack_g.GetComponent<CardStack>().cards.Count > 0)
+                        {
+                            p.prizeStack_g.GetComponent<CardStack>().moveTo(roundWinner.deck, 1);
+                            yield return new WaitForSeconds(0.02f);
+                        }
+                    }
+                }
+                victorySound.Play();
+            }
+
+            players.Find(x => x.goesFirst == true).goesFirst = false;               //remove first turn privilege from previous winner
+            roundWinner.goesFirst = true;                                           //give them first turn
+            players.ForEach(x => x.activeCard_g.GetComponent<CardStack>()           //each active card goes to winner
+                .moveTo(roundWinner.deck, 1));
+            curPhase = phase.upkeep;
+        }
+    }
+
+    IEnumerator gameEndPhase()
+    {
+        yield return new WaitUntil(() => curPhase == phase.gameEnd);
+
+        Debug.Log("Congratulations");
+
+        //Crazy end game animation with all cards spinning
+        foreach (Player p in players)
+        {
+            foreach (GameObject c in p.hand_g)
+            {
+                while (true)
+                    c.transform.Rotate(new Vector3(0f, 0f, 0.2f));
+            }
+        }
+        yield return null;
+    }
+
+}
