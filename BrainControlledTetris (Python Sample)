@@ -1,0 +1,418 @@
+#Last update: 4/12/2015
+#
+#Changes and update:
+#- Clean up unused line
+#- Recording function completed
+#   Features inc:
+#   - Data analysis (min, max, average PSD over duration of recording)
+#   - Multiple plot for alpha, beta, theta
+#   - Save and load data in txt form (easy to save and load 2D-array data)
+#
+#Next on list:
+#- Offline analysis
+#- Determining method for tetris control
+#- Send 1,2,3 to tetris for control
+
+import numpy as np
+from numpy import convolve
+import scipy as sp
+from scipy import signal
+import matplotlib.pyplot as py
+import gevent
+from emokit.emotiv import Emotiv
+import time
+
+#======GLOBAL VARS=======
+numSamples = 256
+vecDivNum = 4 #how many chunks the vec array is broken into
+headset = Emotiv( display_output=False)     
+gevent.spawn(headset.setup)
+gevent.sleep(1)
+firstDataCollected = False
+#========================
+
+######################## SIGNAL PROCESSING CLASS ############################
+class sigprocess(object):
+    def __init___(self, data, ch = 14, freqs = 128):
+
+        #Data Initialisation
+        self.data = np.array(data) #Copy data object
+        self.data_l = len(data[0])
+        self.chnum = ch #Initiate channel number
+        self.freq_s = freqs #Sampling frequency
+        self.freq_n = freqs/2 #Nyquist frequency
+
+    def setup(self, ch = 14, freqs = 128):
+        self.data = []
+        self.chnum = ch
+        self.freq_s = freqs
+        self.freq_n = freqs/2
+
+        self.FT_r = []
+        self.FT_f = []
+        self.FT_filt = []
+        
+        ##FEATURES
+        self.alphaP = np.zeros(14)
+        self.betaP = np.zeros(14)
+        self.gammaP = np.zeros(14)
+        self.thetaP = np.zeros(14)
+        self.deltaP = np.zeros(14)
+
+        self.thetaP_total = np.zeros((14,0))
+        self.alphaP_total = np.zeros((14,0))
+        self.betaP_total = np.zeros((14,0))
+        
+        self.freq_maxVal = np.zeros(14)
+        self.freq_maxHz = np.zeros(14)
+        
+    def addData(self, data):
+
+        #Insert data to variable
+        self.data = data
+        
+        
+    def movHam(self, function, window = 50):
+        self.weights = sp.hamming(window) #hamming window
+        self.result = np.convolve(function, self.weights, 'valid') #perform convolution on values with windows F(t)*G(t)
+
+        return result
+    
+    def movRect(self, window = 50):
+        self.weights = np.repeat(1.0, window) #creates and array of 1 with the length of windows and divide by windows length (1/M)
+        self.data = np.convolve(self.data, self.weights, 'valid') #convolute the the data with average window
+        
+    def myFilter(self, order = 4., low = 5., high = 40.):
+        self.Wc = np.array([low, high]) / self.freq_n
+        self.btype = 'band'
+
+        self.b, self.a = sp.signal.butter(order, self.Wc, self.btype)
+        self.data = sp.signal.filtfilt(self.b,self.a, self.data)
+        
+    def fft(self):                      
+        self.FT_f = np.fft.fftfreq(numSamples, (1./self.freq_s)) #return the frequency of FFT
+        self.FT_f = np.abs(self.FT_f[:numSamples/2]) #Take only the first half of the data
+
+        self.FT_r = np.fft.fft(self.data) #FFT data
+        self.FT_r = self.FT_r[:,:numSamples/2] #Only take first half of data
+        self.FT_r = np.abs(self.FT_r)
+
+    
+    def plotdata(self):
+        numGraphs = 2
+        for i in range(self.chnum * numGraphs):
+            #FFT after filter
+            if i % numGraphs == numGraphs - 2:
+                py.subplot(self.chnum,numGraphs,i)
+                py.plot(self.FT_f, self.FT_r[i/numGraphs - 1])
+            py.locator_params(nbins = 2, axis = 'y')
+
+            #Data after filter
+            if i % numGraphs == numGraphs - 1:
+                py.subplot(self.chnum,numGraphs,i)
+                py.plot(np.linspace(0,numSamples / self.freq_s,numSamples), self.data[i/numGraphs])
+            py.locator_params(nbins = 2, axis = 'y')
+
+        py.subplots_adjust(left=0.05, bottom=0.05,
+                    right=0.95, top=0.95,
+                    wspace=0.2, hspace=0.4)
+        
+        py.draw()
+        
+    def getMaxFreq(self):
+        print 'empty function: getMaxFreq'
+        #Get Max index and value of freq
+        for i in range(self.chnum):
+            self.freq_maxHz[i], self.freq_maxVal[i] = max(enumerate(self.FT_r[i,:]), key=lambda z: z[1])  
+            self.freq_maxHz[i] = self.freq_maxHz[i] * self.freq_n / self.FT_f.size
+        print 'values: ', self.freq_maxVal
+        print 'frequencies: ', self.freq_maxHz
+
+    def getPowers(self):
+        self.thetaP = self.extPSD(4,7)
+        self.alphaP = self.extPSD(8,12)
+        self.betaP = self.extPSD(13,38)
+        return self.thetaP, self.alphaP, self. betaP
+    
+    def recordPowers(self, theta_temp, alpha_temp, beta_temp):
+        #Stack the temporary calculated data into an array
+        self.thetaP_total = np.column_stack((self.thetaP_total, theta_temp))
+        self.alphaP_total = np.column_stack((self.alphaP_total, alpha_temp))
+        self.betaP_total = np.column_stack((self.betaP_total, beta_temp))
+
+    def getPowerAvgs(self, a, b, t):
+        tp_avg =[]
+        bp_avg =[]
+        ap_avg =[]
+
+        ap_avg = np.sum(a[:])/self.chnum
+        bp_avg = np.sum(b[:])/self.chnum
+        tp_avg = np.sum(t[:])/self.chnum
+        print'\n Power Averages:'
+        print '\t alpha', ap_avg, '\tbeta', bp_avg, '\ttheta', tp_avg
+    
+
+    def getFeat(self, a,b,t):
+        #self.getMaxFreq()
+        #self.getPowers()
+        EEG.getPowerAvgs(a,b,t)        
+        return
+        
+
+    def extPSD(self, min_f = 8, max_f = 12):
+        self.PSD = np.zeros(14)
+        if self.FT_f == None:
+            print 'Fourier transform has not yet been calculated. Please execute the function fft()'
+
+        #Re-sort the value if min is larger than max
+        if max_f < min_f: min_f, max_f = max_f, min_f
+
+        #Arrange the index array from minimum to maximum
+        idx_array = np.r_[self.FT_f >= min_f] & np.r_[self.FT_f <= max_f]
+        
+        T = 1./self.freq_s
+        df = self.FT_f[1] - self.FT_f[0]
+    
+        for i in range(self.chnum):
+            self.PSD[i] = np.sum(self.FT_r[i, idx_array]**2) #PSD = x[n]^2
+            self.PSD[i] = (1./2*T)*self.PSD[i]*df # PSD = 1/2T * (summation of x^2) df
+
+        return self.PSD
+
+##################### END OF SIGNAL PROCESSING CLASS ##########################        
+
+
+############################## BUFFER CLASS ###################################
+class Buffer(object): #holds the data from the samples
+    def __init__ (self, _numChan = 14, _vecSize = numSamples):
+        self.numChan = _numChan
+        self.vecSize = _vecSize
+        self.bufferSize = self.vecSize/vecDivNum
+        self.vec = np.zeros((self.numChan,self.vecSize)) #will hold 256 samples (2 seconds)
+        self.buffer = np.zeros((self.numChan,self.bufferSize)) #will hold 64 samples (0.5 seconds)
+        self.sampleNum = 0
+        self.buffFull = False
+        self.vecFull = False
+
+    def update(self, data): #channel is the electrode number
+        self.buffer = np.column_stack((self.buffer, data)) #add a column to the buffer
+        self.buffer = self.buffer[:,1:] #remove the first column
+        self.sampleNum += 1
+        if self.sampleNum >= self.bufferSize: #upon filling the buffer, update the data vector
+            if self.sampleNum % self.bufferSize != 0: return #if the buffer isn't filled dont bother updating vec
+            self.vec = np.column_stack((self.vec, self.buffer)) #add the buffer to the data vector
+            self.vec = self.vec[:, self.bufferSize:]
+            self.buffFull = True ##Buffer is full
+            if self.sampleNum % (self.bufferSize * vecDivNum) == 0: ##Check if buffer as been filled vecDivNum times
+                self.vecFull = True ##Vector buffer is full
+            
+########################## END OF BUFFER CLASS ###################################
+                
+########################### RECORDING FUNCTION ###################################
+def recordData():
+    print 'Please enter duration of recording:'
+    duration = raw_input()    
+    theta_r = np.zeros((14,0))
+    alpha_r = np.zeros((14,0))
+    beta_r = np.zeros((14,0))
+    theta_temp = np.zeros((14,0))
+    alpha_temp = np.zeros((14,0))
+    beta_temp = np.zeros((14,0))
+    s_val = np.zeros((14,0))
+    timeStart = time.time()
+    
+    try:
+        print 'begin rec w dur: ', duration
+        while ((time.time() - timeStart)  <= float(duration)):
+            print 'time elapsed: ', (time.time() - timeStart)
+            packet = headset.dequeue()#read from headset
+            fillBuffers(packet)
+            EEG.myFilter(4, 5., 64)
+            EEG.fft()
+            theta_temp, alpha_temp, beta_temp = EEG.getPowers()
+            EEG.getFeat(alpha_temp, beta_temp, theta_temp)
+            EEG.recordPowers(theta_temp, alpha_temp, beta_temp)
+        timeFinish = time.time()
+        print 'Finished Recording at elapsed time of: ', (time.time() - timeStart)          
+
+        ##################### DATA PLOT AND ANALYSIS #########################
+        
+        size =  EEG.alphaP_total.shape #Obtain size of the array (string format)
+        size = int(size[0]), int(size[1]) #Convert size from string into array
+
+        ##Create line space for the whole duration with total number of points according to the number of data
+        x  = np.linspace(0, (timeFinish - timeStart), size[1])
+
+        ##### PLOT ALPHA #####
+        py.figure()
+        for i in range(size[0]):
+            py.subplot(size[0]/2,2,i)
+            py.plot(x, EEG.alphaP_total[i])
+        py.locator_params(nbins = 3, axis = 'y')
+
+        ##### PLOT BETA #####
+        py.figure()
+        for i in range(size[0]):
+            py.subplot(size[0]/2,2,i)
+            py.plot(x, EEG.betaP_total[i])
+        py.locator_params(nbins = 3, axis = 'y')
+
+        ##### PLOT THETA #####
+        py.figure()
+        for i in range(size[0]):
+            py.subplot(size[0]/2,2,i)
+            py.plot(x, EEG.thetaP_total[i])
+        py.locator_params(nbins = 3, axis = 'y')            
+        py.show()
+
+        ####OBTAIN MAXIMUM AND MINIMUM VALUE####
+        maxPSDa_tick = np.zeros(size[0])
+        maxPSDb_tick = np.zeros(size[0])
+        maxPSDt_tick = np.zeros(size[0])
+        maxPSD_a = np.zeros(size[0])
+        maxPSD_b = np.zeros(size[0])
+        maxPSD_t = np.zeros(size[0])
+
+        minPSDa_tick = np.zeros(size[0]) 
+        minPSDb_tick = np.zeros(size[0])
+        minPSDt_tick = np.zeros(size[0])
+        minPSD_a = np.zeros(size[0])
+        minPSD_a = np.zeros(size[0])
+        minPSD_t = np.zeros(size[0])
+        
+        for i in range(size[0]):
+            maxPSDa_tick[i], maxPSD_a[i] = max(enumerate(EEG.alphaP_total[i,:]), key=lambda z: z[1])  
+            maxPSDb_tick[i], maxPSD_b[i] = max(enumerate(EEG.betaP_total[i,:]), key=lambda z: z[1])
+            maxPSDt_tick[i], maxPSD_t[i] = max(enumerate(EEG.thetaP_total[i,:]), key=lambda z: z[1])
+
+        for i in range(size[0]):
+            minPSDa_tick[i], minPSD_a[i] = min(enumerate(EEG.alphaP_total[i,:]), key=lambda z: z[1])  
+            minPSDb_tick[i], minPSD_b[i] = min(enumerate(EEG.betaP_total[i,:]), key=lambda z: z[1])
+            minPSDt_tick[i], minPSD_t[i] = min(enumerate(EEG.thetaP_total[i,:]), key=lambda z: z[1])
+
+        #####OBTAIN AVERAGE/THRESHOLD VALUE####
+        avg_alpha = np.zeros(size[0])
+        avg_beta = np.zeros(size[0]])
+        avg_theta = np.zeros(size[0])
+        
+        for i in range(size[0]):
+            avg_a[i] = np.sum(EEG.alphaP_total[i,:])/size[1]
+            avg_b[i] = np.sum(EEG.betaP_total[i,:])/size[1]
+            avg_t[i] = np.theta(EEG.betaP_total[i,:])/size[1]
+
+        #####PRINTING OF ANALYSIS####
+        print 'Printig analysis with sequence of Channel:', channels
+        print 'Alpha band analysis'
+        print 'Average power:', avg_alpha
+        print '\nMaximum power:',maxPSD_a
+        print 'Maximum occur at:' maxPSDa_tick
+        print '\nMinimum power:',minPSD_a
+        print 'Minimumm occur at:' minPSDa_tick
+
+        print '\n\n'
+        print 'Beta band analysis'
+        print 'Average power:', avg_beta
+        print '\nMaximum power:',maxPSD_b
+        print 'Maximum occur at:' maxPSDb_tick
+        print '\nMinimum power:',minPSD_b
+        print 'Minimumm occur at:' minPSDb_tick
+
+        print '\n\n'
+        print 'Theta band analysis'
+        print 'Average power:', avg_theta
+        print '\nMaximum power:',maxPSD_t
+        print 'Maximum occur at:' maxPSDt_tick
+        print '\nMinimum power:',minPSD_t
+        print 'Minimumm occur at:' minPSDt_tick
+        #####################################################################
+            
+        ########################### SAVE FILE ###############################
+        
+        #write the stored data into a file
+        print 'Enter save fle name:'
+        fname = raw_input()      
+        np.savetxt(fname +'_a', EEG.alphaP_total)
+        np.savetxt(fname +'_b', EEG.betaP_total )
+        np.savetxt(fname +'_t', EEG.thetaP_total)
+
+        ##### LOAD DATA ####
+        ##data = [np.loadtxt('test')]
+        ##data = np.array(data)
+        #####################################################################        
+
+        
+    except KeyboardInterrupt:
+        print 'failed a reading'
+        headset.close()
+    finally:
+        headset.close()
+        print 'closed headset connection'
+########################### END OFRECORDING FUNCTION ##############################
+
+############################# FILL BUFFER FUNCTION ################################
+def fillBuffers(packet):
+    while(buff.vecFull == False):#store small buffer data into large buff until large buff is full
+        while(buff.buffFull == False):#store data in small buffer until small buff is full
+            # Collect data for each channel
+            val = [packet.sensors[ch]['value'] for ch in channels] 
+            val = np.column_stack(val) #turns it into an array type
+            val = val.T #transposes val so it can be column_stacked
+            buff.update(val)
+        buff.buffFull = False
+    buff.vecFull = False
+    EEG.addData(buff.vec)
+
+######################## END OF FILL BUFFER FUNCTION ##############################
+    
+################################ MAIN FUNCTION ####################################
+def main():
+    try:
+        py.ion()
+        py.figure(figsize=(12,10))
+        while True:
+            py.clf()
+            packet = headset.dequeue()#read from headset
+            fillBuffers(packet)
+            EEG.myFilter(4,1.,64)
+            EEG.fft()
+            EEG.extPSD()
+            EEG.getFeat()
+            #print 'plotting data'
+            EEG.plotdata()
+            firstDataCollected = True
+            gevent.sleep(0)
+
+    except KeyboardInterrupt:
+        headset.close()
+    finally:
+        headset.close()
+
+########################### END OF MAIN FUNCTION ###################################    
+
+##################################################################################
+def test():
+    while True:
+        val = np.array((np.random.random((14,256))) * 10 - 0.5)
+        EEG.addData(val)                
+        EEG.myFilter(4,5.,40)
+        EEG.fft()
+        PSD = EEG.extPSD(8,12)
+        EEG.plotdata()
+
+        print PSD
+##################################################################################
+    
+#================Globals:
+channels = ['F3','FC6','P7','T8','F7','F8','T7',
+            'P8','AF4','F4','AF3','O2','O1','FC5',]
+buff = Buffer()
+EEG = sigprocess()
+EEG.setup()
+
+
+recordData()    
+
+
+    
+
+    
