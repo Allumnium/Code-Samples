@@ -1,7 +1,7 @@
 # Code-Samples
 
 FANUC TP Sample:
-While at the system integrator I created hundreds of TP scripts, usually between 10-100 lines of TP code. However, sometimes I had to implement some complex features. One example of this is was a dynamic picking routine which used vision and would have the robot pick multiple parts depending on their position and orientation on the incoming conveyor. I no longer have access to that code, as it belongs to the company, so here is a short TP program similar to the ones that I used to use.
+While at Clear Automation I created hundreds of TP scripts, usually between 10-100 lines of TP code. However, sometimes I had to implement some complex features. One example of this is was a dynamic picking routine which used vision and would have the robot pick multiple parts depending on their position and orientation on the incoming conveyor. I no longer have access to that code, as it belongs to the company, so here is a short TP program similar to the ones that I used to use.
 
 C# Sample:
 This code is for a personal game for my friends and I did not intended to share it with anyone while writing it. Therefore, the comments and naming styles were not chosen as carefully as I might do in production code. This was a recent 4 day project and is not completed.
